@@ -1,9 +1,9 @@
 #!/bin/bash
 # ============================================================
-#  set_static_ip.sh — Configure Ethernet to Static IP
+#  create-static.sh — Configure Ethernet to Static IP
 #  Supports: Ubuntu 22.04/24.04/26.x (Netplan)
 #            Arch Linux (systemd-networkd)
-#  Run as root: sudo bash set_static_ip.sh
+#  Run as root: sudo bash create-static.sh
 # ============================================================
 
 set -euo pipefail

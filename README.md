@@ -17,7 +17,8 @@ An interactive bash script to configure a static IP address on an Ethernet inter
 > **Note:** If the script is stored on an NTFS/exFAT mount (e.g. `/mnt/...`), `chmod +x` won't work. Always run it with `bash` directly:
 
 ```bash
-sudo bash create-static.sh
+sudo chmod +x ./*.*
+sudo bash run.sh
 ```
 
 The script is fully interactive — it will prompt you for:
