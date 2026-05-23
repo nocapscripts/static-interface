@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================
 #  set_static_ip.sh — Configure Ethernet to Static IP
-#  Works on Ubuntu 22.04 / 24.04 / 26.xx (Netplan)
+#  Supports: Ubuntu 22.04/24.04/26.x (Netplan)
+#            Arch Linux (systemd-networkd)
 #  Run as root: sudo bash set_static_ip.sh
 # ============================================================
 
@@ -20,8 +21,38 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# ── Detect distro ────────────────────────────────────────────
+detect_distro() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        echo "${ID,,}"   # lowercase: ubuntu, arch, debian, etc.
+    else
+        echo "unknown"
+    fi
+}
+
+DISTRO=$(detect_distro)
+
+case "$DISTRO" in
+    ubuntu|debian|linuxmint|pop)  METHOD="netplan" ;;
+    arch|manjaro|endeavouros|garuda|centos|cachyos) METHOD="networkd" ;;
+    *)
+        # Fallback: if netplan binary exists use it, else networkd
+        if command -v netplan &>/dev/null; then
+            METHOD="netplan"
+        elif systemctl is-active --quiet systemd-networkd 2>/dev/null || \
+             systemctl is-enabled --quiet systemd-networkd 2>/dev/null; then
+            METHOD="networkd"
+        else
+            echo -e "${RED}Unsupported distro: ${DISTRO}. Cannot auto-detect network manager.${NC}"
+            exit 1
+        fi
+        ;;
+esac
+
 echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}${CYAN}   Ubuntu Static IP Configurator (Netplan) ${NC}"
+echo -e "${BOLD}${CYAN}   Static IP Configurator                  ${NC}"
+echo -e "${BOLD}${CYAN}   Distro : ${DISTRO}  │  Method: ${METHOD}  ${NC}"
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
 
 # ── List ethernet interfaces ─────────────────────────────────
@@ -77,25 +108,28 @@ done
 read -rp "$(echo -e "${BOLD}DNS servers, space-separated (default: 8.8.8.8 1.1.1.1): ${NC}")" DNS_INPUT
 DNS_INPUT="${DNS_INPUT:-8.8.8.8 1.1.1.1}"
 
-# Build YAML DNS list
-DNS_YAML=""
-for dns in $DNS_INPUT; do
-    DNS_YAML+="          - ${dns}"$'\n'
-done
+# ════════════════════════════════════════════════════════════
+#  NETPLAN (Ubuntu / Debian)
+# ════════════════════════════════════════════════════════════
+apply_netplan() {
+    # Build YAML DNS list
+    local DNS_YAML=""
+    for dns in $DNS_INPUT; do
+        DNS_YAML+="          - ${dns}"$'\n'
+    done
 
-# ── Locate / create Netplan config ───────────────────────────
-NETPLAN_DIR="/etc/netplan"
-NETPLAN_FILE="${NETPLAN_DIR}/99-static-${IFACE}.yaml"
+    local NETPLAN_DIR="/etc/netplan"
+    local NETPLAN_FILE="${NETPLAN_DIR}/99-static-${IFACE}.yaml"
 
-# Backup any existing file
-if [[ -f "$NETPLAN_FILE" ]]; then
-    BACKUP="${NETPLAN_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$NETPLAN_FILE" "$BACKUP"
-    echo -e "${YELLOW}Backed up existing config → ${BACKUP}${NC}"
-fi
+    mkdir -p "$NETPLAN_DIR"
 
-# ── Write Netplan YAML ───────────────────────────────────────
-cat > "$NETPLAN_FILE" <<EOF
+    if [[ -f "$NETPLAN_FILE" ]]; then
+        local BACKUP="${NETPLAN_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$NETPLAN_FILE" "$BACKUP"
+        echo -e "${YELLOW}Backed up existing config → ${BACKUP}${NC}"
+    fi
+
+    cat > "$NETPLAN_FILE" <<EOF
 network:
   version: 2
   renderer: networkd
@@ -112,31 +146,116 @@ network:
 ${DNS_YAML}
 EOF
 
-chmod 600 "$NETPLAN_FILE"
-echo -e "\n${GREEN}Netplan config written to: ${BOLD}${NETPLAN_FILE}${NC}"
-echo -e "\n${YELLOW}Config preview:${NC}"
-echo "─────────────────────────────────────────"
-cat "$NETPLAN_FILE"
-echo "─────────────────────────────────────────"
+    chmod 600 "$NETPLAN_FILE"
+    echo -e "\n${GREEN}Netplan config written to: ${BOLD}${NETPLAN_FILE}${NC}"
+    echo -e "\n${YELLOW}Config preview:${NC}"
+    echo "─────────────────────────────────────────"
+    cat "$NETPLAN_FILE"
+    echo "─────────────────────────────────────────"
 
-# ── Apply ────────────────────────────────────────────────────
-echo ""
-read -rp "$(echo -e "${BOLD}Apply now? This will change your network. (y/N): ${NC}")" CONFIRM
+    echo ""
+    read -rp "$(echo -e "${BOLD}Apply now? This will change your network. (y/N): ${NC}")" CONFIRM
+    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo -e "\n${CYAN}Validating config...${NC}"
+        netplan generate 2>&1 || { echo -e "${RED}Config invalid! Rolling back.${NC}"; rm -f "$NETPLAN_FILE"; exit 1; }
+        echo -e "${CYAN}Applying...${NC}"
+        netplan apply
+        sleep 2
+        local NEW_IP
+        NEW_IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -oP '(?<=inet )\S+' || echo "not assigned yet")
+        echo -e "\n${GREEN}${BOLD}Done!${NC} ${IFACE} → ${BOLD}${NEW_IP}${NC}"
+        echo -e "${YELLOW}Tip: if SSH dropped, reconnect to ${STATIC_IP}${NC}"
+    else
+        echo -e "\n${YELLOW}Skipped. Apply manually: ${BOLD}sudo netplan apply${NC}"
+    fi
 
-if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo -e "\n${CYAN}Validating config...${NC}"
-    netplan generate 2>&1 || { echo -e "${RED}Netplan config invalid! Rolling back.${NC}"; rm -f "$NETPLAN_FILE"; exit 1; }
+    echo -e "\n${CYAN}To revert to DHCP: delete ${NETPLAN_FILE} and run: sudo netplan apply${NC}\n"
+}
 
-    echo -e "${CYAN}Applying...${NC}"
-    netplan apply
+# ════════════════════════════════════════════════════════════
+#  SYSTEMD-NETWORKD (Arch Linux)
+# ════════════════════════════════════════════════════════════
+apply_networkd() {
+    # Build DNS line (space-separated for networkd)
+    local DNS_LINE
+    DNS_LINE=$(echo "$DNS_INPUT" | tr '\n' ' ' | xargs)
 
-    sleep 2
-    NEW_IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -oP '(?<=inet )\S+' || echo "not assigned yet")
-    echo -e "\n${GREEN}${BOLD}Done!${NC} ${IFACE} now has IP: ${BOLD}${NEW_IP}${NC}"
-    echo -e "${YELLOW}Tip: if SSH dropped, reconnect to ${STATIC_IP}${NC}"
-else
-    echo -e "\n${YELLOW}Skipped apply. Run manually:${NC}"
-    echo -e "  ${BOLD}sudo netplan apply${NC}"
-fi
+    local NET_DIR="/etc/systemd/network"
+    local NET_FILE="${NET_DIR}/20-static-${IFACE}.network"
 
-echo -e "\n${CYAN}To revert to DHCP, delete ${NETPLAN_FILE} and run: sudo netplan apply${NC}\n"
+    mkdir -p "$NET_DIR"
+
+    if [[ -f "$NET_FILE" ]]; then
+        local BACKUP="${NET_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$NET_FILE" "$BACKUP"
+        echo -e "${YELLOW}Backed up existing config → ${BACKUP}${NC}"
+    fi
+
+    cat > "$NET_FILE" <<EOF
+[Match]
+Name=${IFACE}
+
+[Network]
+Address=${STATIC_IP}/${PREFIX}
+Gateway=${GATEWAY}
+DNS=${DNS_LINE}
+
+[Link]
+RequiredForOnline=yes
+EOF
+
+    chmod 600 "$NET_FILE"
+    echo -e "\n${GREEN}systemd-networkd config written to: ${BOLD}${NET_FILE}${NC}"
+    echo -e "\n${YELLOW}Config preview:${NC}"
+    echo "─────────────────────────────────────────"
+    cat "$NET_FILE"
+    echo "─────────────────────────────────────────"
+
+    # Also configure systemd-resolved for DNS if available
+    if command -v resolvectl &>/dev/null; then
+        echo -e "\n${CYAN}Note: systemd-resolved detected — DNS will be managed automatically.${NC}"
+    fi
+
+    echo ""
+    read -rp "$(echo -e "${BOLD}Apply now? This will restart systemd-networkd. (y/N): ${NC}")" CONFIRM
+    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo -e "\n${CYAN}Enabling & restarting systemd-networkd...${NC}"
+
+        # Disable any conflicting DHCP service on this interface (NetworkManager, dhcpcd)
+        if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+            echo -e "${YELLOW}Detected NetworkManager — stopping it for this interface.${NC}"
+            nmcli device set "$IFACE" managed no 2>/dev/null || true
+        fi
+        if systemctl is-active --quiet dhcpcd 2>/dev/null; then
+            echo -e "${YELLOW}Stopping dhcpcd (conflicts with networkd)...${NC}"
+            systemctl stop dhcpcd
+            systemctl disable dhcpcd 2>/dev/null || true
+        fi
+
+        systemctl enable systemd-networkd --now
+        systemctl restart systemd-networkd
+
+        # Restart resolved if present
+        if systemctl list-units --type=service | grep -q systemd-resolved; then
+            systemctl enable systemd-resolved --now
+            systemctl restart systemd-resolved
+        fi
+
+        sleep 3
+        local NEW_IP
+        NEW_IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -oP '(?<=inet )\S+' || echo "not assigned yet")
+        echo -e "\n${GREEN}${BOLD}Done!${NC} ${IFACE} → ${BOLD}${NEW_IP}${NC}"
+        echo -e "${YELLOW}Tip: if SSH dropped, reconnect to ${STATIC_IP}${NC}"
+    else
+        echo -e "\n${YELLOW}Skipped. Apply manually:${NC}"
+        echo -e "  ${BOLD}sudo systemctl restart systemd-networkd${NC}"
+    fi
+
+    echo -e "\n${CYAN}To revert to DHCP: delete ${NET_FILE} and restart systemd-networkd${NC}\n"
+}
+
+# ── Dispatch ─────────────────────────────────────────────────
+case "$METHOD" in
+    netplan)   apply_netplan ;;
+    networkd)  apply_networkd ;;
+esac
